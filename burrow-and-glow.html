@@ -1,0 +1,355 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Burrow &amp; Glow</title>
+<style>
+:root{color-scheme:dark;--ink:#fcf0d4;--muted:#b9c5b8;--edge:#34473f;--gold:#f7cb69;--mint:#9ee4c9}
+*{box-sizing:border-box}body{margin:0;min-height:100vh;background:radial-gradient(ellipse at 35% 0%,#26362e 0%,#111c1b 48%,#0d1616 100%);color:var(--ink);font:16px/1.5 system-ui,sans-serif}
+main{max-width:1180px;margin:auto;padding:clamp(16px,3vw,38px) clamp(12px,3vw,32px) 26px}
+header{display:flex;justify-content:space-between;align-items:end;gap:16px;margin-bottom:17px}
+h1{font:700 clamp(34px,6vw,65px)/1 Georgia,serif;letter-spacing:-.055em;margin:0}h1 span{color:var(--gold)}
+.subtitle{margin:6px 0 0;color:var(--muted);font-size:14px}
+button{color:inherit;background:#20322d;border:1px solid #567066;border-radius:9px;padding:9px 15px;font:inherit;min-height:44px;cursor:pointer;white-space:nowrap}button:hover{background:#30483f}button:focus-visible{outline:3px solid var(--gold);outline-offset:3px}
+.stage{position:relative;border:1px solid #4a6558;border-radius:15px;overflow:hidden;background:#121e20;box-shadow:0 18px 54px #0007}
+canvas{display:block;width:100%;height:auto}
+.goal{display:flex;gap:12px;align-items:center;padding:12px 16px;border-top:1px solid var(--edge);background:#162523;min-height:52px}
+.goal::before{content:'';width:9px;height:9px;flex:none;border-radius:50%;background:var(--gold);box-shadow:0 0 14px #f7cb6980}
+.goal p{margin:0;font-size:15px}
+footer{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:13px}
+.controls{border:1px solid var(--edge);border-radius:10px;padding:10px 14px;background:#162322;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px}
+.controls strong{color:var(--mint)}.controls:last-of-type strong{color:var(--gold)}
+.keys{display:flex;align-items:center;gap:5px;font-size:13px;color:var(--muted)}
+kbd{display:inline-grid;place-items:center;height:24px;min-width:23px;padding:0 4px;border:1px solid #65766d;border-radius:4px;background:#24362f;color:#fff5db;font:600 12px ui-monospace,monospace}.action{margin-left:6px}
+@media(max-width:630px){footer{grid-template-columns:1fr}.goal p{font-size:14px}.subtitle{font-size:13px}}
+@media(min-width:800px) and (max-height:830px){main{max-width:min(1180px, calc((100vh - 232px) * 2 + 66px));padding-top:18px}}
+</style>
+</head>
+<body>
+<main>
+<header><div><h1>Burrow <span>&amp; Glow</span></h1><p class="subtitle">水淹地洞 · 同键盘双人合作</p></div><button id="reset" type="button">重新开始</button></header>
+<section class="stage" aria-label="双人游戏">
+<canvas id="board" width="1080" height="540" role="img" aria-label="地洞地图，鼹鼠在玻璃左侧，萤火虫在右侧"></canvas>
+<div class="goal"><p id="goal" role="status" aria-live="polite"></p></div>
+</section>
+<footer aria-label="游戏操作">
+<div class="controls"><strong>鼹鼠</strong><div class="keys"><kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd> 移动 <kbd class="action">F</kbd> 挖掘</div></div>
+<div class="controls"><strong>萤火虫</strong><div class="keys"><kbd>↑</kbd><kbd>←</kbd><kbd>↓</kbd><kbd>→</kbd> 移动 <kbd class="action">/</kbd> 闪光</div></div>
+</footer>
+</main>
+<script>
+'use strict';
+
+const board = document.querySelector('#board');
+const ctx = board.getContext('2d');
+const goal = document.querySelector('#goal');
+const tile = 60;
+const drain = { x: 7, y: 3 };
+const exit = { x: 16, y: 7 };
+const stone = new Set(['3,2','4,2','3,3','4,3','11,5','12,5','13,5']);
+const soil = new Set(['5,3','6,5','6,6']);
+const pressed = new Map();
+const controls = {
+  mole: { KeyA: [-1,0], KeyD: [1,0], KeyW: [0,-1], KeyS: [0,1] },
+  fly: { ArrowLeft: [-1,0], ArrowRight: [1,0], ArrowUp: [0,-1], ArrowDown: [0,1] }
+};
+const gameKeys = new Set([...Object.keys(controls.mole), ...Object.keys(controls.fly), 'KeyF', 'Slash']);
+let state;
+let notice = '';
+let noticeUntil = 0;
+
+function reset() {
+  state = {
+    mole: { x: 2, y: 6, drawX: 2, drawY: 6, face: 1, nextMove: 0 },
+    fly: { x: 13, y: 3, drawX: 13, drawY: 3, face: -1, nextMove: 0 },
+    dug: new Set(), particles: [], flash: null, marked: false, drainedAt: null, won: false
+  };
+  pressed.clear();
+  noticeUntil = 0;
+  updateGoal();
+}
+
+function same(a, b) { return a.x === b.x && a.y === b.y; }
+function distance(a, b) { return Math.abs(a.x - b.x) + Math.abs(a.y - b.y); }
+function dry(now) { return state.drainedAt !== null && now - state.drainedAt >= 1500; }
+
+function updateGoal(now = performance.now()) {
+  let text;
+  if (state.won) text = '逃出地洞！鼹鼠和萤火虫都已安全抵达。';
+  else if (now < noticeUntil) text = notice;
+  else if (dry(now)) text = '水退了。穿过底部通道，两只角色一起到右下角出口。';
+  else if (state.drainedAt !== null) text = '排水口已打开，底部通道正在退水。';
+  else if (state.marked) text = '排水口已标出。鼹鼠走到标记旁，按 F 挖开。';
+  else text = '萤火虫飞到玻璃右侧的发光花旁，按 / 照出排水口。';
+  if (goal.textContent !== text) goal.textContent = text;
+}
+
+function hint(text, now) {
+  notice = text;
+  noticeUntil = now + 1800;
+  updateGoal(now);
+}
+
+function kind(x, y) {
+  if (x <= 0 || x >= 17 || y <= 0 || y >= 8 || stone.has(x+','+y)) return 'rock';
+  if (x === 8) return y === 7 ? 'gate' : 'glass';
+  if (x === drain.x && y === drain.y && state.drainedAt === null) return 'drain';
+  if (soil.has(x+','+y) && !state.dug.has(x+','+y)) return 'soil';
+  return 'floor';
+}
+
+function burst(x, y, color, now, count = 12) {
+  for (let i = 0; i < count; i++) {
+    const a = (i / count) * Math.PI * 2;
+    const speed = 20 + (i % 4) * 11;
+    state.particles.push({ x:x*tile+30, y:y*tile+30, vx:Math.cos(a)*speed, vy:Math.sin(a)*speed, color, start:now });
+  }
+}
+
+function move(player, vector, now) {
+  if (state.won) return;
+  const p = state[player];
+  const [dx, dy] = vector;
+  if (dx) p.face = dx;
+  const x = p.x + dx;
+  const y = p.y + dy;
+  const target = kind(x, y);
+  if (target === 'rock' || target === 'glass' || target === 'drain'
+    || (target === 'gate' && !dry(now)) || (target === 'soil' && player === 'mole')) return;
+  p.x = x;
+  p.y = y;
+  if (same(state.mole, exit) && same(state.fly, exit)) {
+    state.won = true;
+    burst(exit.x, exit.y, '#ffe493', now, 24);
+  }
+}
+
+function flash(now) {
+  if (state.won) return;
+  const p = state.fly;
+  state.flash = { x:p.x, y:p.y, start:now };
+  burst(p.x, p.y, '#ffd86f', now);
+  if (state.drainedAt !== null || state.marked) return;
+  if (distance(p, { x:9, y:3 }) <= 1 && p.x >= 9) {
+    state.marked = true;
+    noticeUntil = 0;
+    burst(drain.x, drain.y, '#ffd86f', now);
+  } else hint('再靠近一些。发光花就在玻璃右侧。', now);
+}
+
+function dig(now) {
+  if (state.won) return;
+  const p = state.mole;
+  if (state.drainedAt === null && distance(p, drain) === 1) {
+    if (state.marked) {
+      state.drainedAt = now;
+      noticeUntil = 0;
+      burst(drain.x, drain.y, '#d9986b', now, 20);
+      return;
+    }
+    hint('让萤火虫先用闪光标出排水口。', now);
+    return;
+  }
+  const x = p.x + p.face;
+  const y = p.y;
+  if (kind(x,y) === 'soil') {
+    state.dug.add(x+','+y);
+    burst(x,y,'#d9986b',now);
+  } else if (state.marked && state.drainedAt === null) hint('靠近发光的排水口，再按 F 挖掘。', now);
+}
+
+document.addEventListener('keydown', event => {
+  if (!gameKeys.has(event.code) || event.metaKey || event.ctrlKey || event.altKey) return;
+  event.preventDefault();
+  if (pressed.has(event.code) || event.repeat) return;
+  const now = performance.now();
+  pressed.set(event.code, now);
+  if (event.code === 'KeyF') dig(now);
+  else if (event.code === 'Slash') flash(now);
+  else {
+    const role = controls.mole[event.code] ? 'mole' : 'fly';
+    move(role, controls[role][event.code], now);
+    state[role].nextMove = now + 180;
+  }
+  updateGoal(now);
+});
+document.addEventListener('keyup', event => pressed.delete(event.code));
+window.addEventListener('blur', () => pressed.clear());
+document.addEventListener('visibilitychange', () => { if (document.hidden) pressed.clear(); });
+document.querySelector('#reset').addEventListener('click', reset);
+
+function box(x,y,w,h,color) { ctx.fillStyle=color; ctx.fillRect(x,y,w,h); }
+function circle(x,y,r,color) {
+  ctx.fillStyle=color; ctx.beginPath(); ctx.arc(x,y,r,0,Math.PI*2); ctx.fill();
+}
+function glow(x,y,r,color) {
+  const g=ctx.createRadialGradient(x,y,0,x,y,r);
+  g.addColorStop(0,color);
+  g.addColorStop(1,'transparent');
+  circle(x,y,r,g);
+}
+function label(text,x,y,color,size=15) {
+  ctx.font='600 '+size+'px system-ui';
+  ctx.fillStyle=color;
+  ctx.textAlign='center';
+  ctx.fillText(text,x,y);
+}
+function hash(x,y) { return ((x*97+y*139+x*y*31)%103)/103; }
+
+function water(x,y,w,h,now,depth) {
+  ctx.save(); ctx.globalAlpha=depth;
+  box(x,y,w,h,'#164d58');
+  for(let row=0;row<3;row++) {
+    for(let col=0;col<Math.ceil(w/24);col++) {
+      const offset=4*Math.sin(now/400+col+row);
+      const start=x+col*24;
+      box(start,y+6+row*11+offset,Math.min(15,w-col*24),2,row%2?'#27919b':'#61beaf');
+    }
+  }
+  ctx.restore();
+}
+
+function terrain(now) {
+  for(let y=0;y<9;y++) for(let x=0;x<18;x++) {
+    const X=x*tile,Y=y*tile;
+    const type=kind(x,y), n=hash(x,y);
+    box(X,Y,tile,tile,x<8?(n>.54?'#514036':'#493a34'):(n>.54?'#243a34':'#20342f'));
+    box(X,Y,tile,1,'#ffffff09'); box(X,Y,1,tile,'#00000024');
+    for(let i=0;i<4;i++) {
+      const a=hash(x+i*8,y+i*13), b=hash(x+i*5+3,y+i*19);
+      box(X+5+a*49,Y+5+b*49,2+i%2,2,n>.5?'#fff1ca22':'#0004');
+    }
+    if(type==='rock') {
+      box(X,Y,tile,tile,n>.5?'#2b3332':'#313a37');
+      box(X+3,Y+3,54,4,'#586257');
+      box(X,Y+54,60,6,'#111d1d');
+      box(X+7+n*20,Y+19,21,3,'#434d46');
+      box(X+24,Y+35+n*8,25,3,'#202c2b');
+    }
+    if(type==='soil'||type==='drain') {
+      box(X+2,Y+3,56,55,'#74513d');
+      box(X+4,Y+6,52,4,'#966a4c');
+      for(let i=0;i<5;i++) box(X+6+hash(x+i,y+i*4)*41,Y+13+i*7,8+i%3,3,'#4d3530');
+    }
+    if(type==='glass') {
+      box(X+8,Y,44,tile,'#31595b'); box(X+11,Y,38,tile,'#437774');
+      box(X+16,Y+3,4,54,'#7eb2a375'); box(X+28,Y+12,13,3,'#c6efe47a');
+      box(X+8,Y+57,44,3,'#204247'); box(X+46,Y,5,60,'#1a3c43');
+    }
+    if(y===7 && x>=6 && x<=14) {
+      const depth=state.drainedAt===null?1:Math.max(0,1-(now-state.drainedAt)/1500);
+      if(depth) water(X,Y+7+(1-depth)*25,60,49-(1-depth)*25,now,depth);
+      else box(X+5,Y+49,50,3,'#51a39538');
+    }
+  }
+  const gateX=8*tile, gateY=7*tile;
+  box(gateX+4,gateY,52,5,'#76978b');
+  box(gateX+4,gateY,7,57,'#76978b');
+  box(gateX+49,gateY,7,57,'#76978b');
+
+  const dx=drain.x*tile+30,dy=drain.y*tile+30;
+  if(state.marked && state.drainedAt===null) {
+    glow(dx,dy,62,'#ffc76c77');
+    ctx.strokeStyle='#ffd782';ctx.lineWidth=3;
+    ctx.strokeRect(dx-20,dy-20,40,40);
+    label('排水口',dx,dy-26,'#fff0b4');
+  }
+  if(state.drainedAt!==null) {
+    circle(dx,dy,19,'#1c2927');circle(dx,dy,14,'#111917');
+    for(let i=-8;i<=8;i+=8) box(dx+i-1,dy-11,3,22,'#688077');
+  }
+
+  const fx=9*tile+30,fy=3*tile+33;
+  if(!state.marked) glow(fx,fy,45+4*Math.sin(now/450),'#ffcf7270');
+  box(fx-2,fy,4,13,'#65826a'); box(fx-6,fy-4,12,9,state.marked?'#658b70':'#eec36c');
+  box(fx-2,fy-8,4,14,state.marked?'#91a881':'#fff0a4');
+
+  const ex=exit.x*tile+30,ey=exit.y*tile+30;
+  glow(ex,ey,77,dry(now)?'#9deac17a':'#96c7aa32');
+  box(ex-19,ey-19,38,38,'#5b846c');box(ex-14,ey-14,28,33,'#172820');
+  box(ex-10,ey-10,20,24,dry(now)?'#a6e8a8':'#31493d');
+  label('出口',ex,ey-27,dry(now)?'#dbffbf':'#a7bfa8');
+}
+
+function sprite(p, role, now, shift) {
+  p.drawX+=(p.x-p.drawX)*.28;
+  p.drawY+=(p.y-p.drawY)*.28;
+  const x=p.drawX*tile+30+shift;
+  const y=p.drawY*tile+30;
+  ctx.save();
+  ctx.translate(Math.round(x),Math.round(y));
+  if(role==='mole') {
+    box(-18,14,36,5,'#221c1a90');
+    ctx.scale(p.face,1);
+    box(-16,-9,29,24,'#8b6e5c'); box(-11,-17,22,31,'#b48a70');
+    box(-9,-20,18,8,'#d0a58a'); box(-14,-17,6,8,'#835649');
+    box(4,-6,16,10,'#e5ad92'); box(16,-4,6,6,'#f79284');
+    box(6,-11,3,4,'#272220'); box(-13,10,9,8,'#d19b7b');
+  } else {
+    ctx.translate(0,Math.sin(now/115)*4);
+    glow(0,2,57,'#ffd46d86');
+    const wing=Math.round(9+4*Math.sin(now/42));
+    box(-wing-4,-11,wing,10,'#d3eac9b5');box(4,-11,wing,10,'#d3eac9b5');
+    box(-6,-8,12,20,'#775b3b');box(-7,1,14,12,'#f8c352');
+    box(-4,4,8,6,'#fff6b6');
+    box(-5,-13,2,6,'#f3d392');box(3,-13,2,6,'#f3d392');
+  }
+  ctx.restore();
+  label(role==='mole'?'鼹鼠':'萤火虫',x,y+28,role==='mole'?'#e0f4df':'#ffdfa0',12);
+}
+
+function render(now) {
+  terrain(now);
+  const f=state.flash;
+  if(f && now-f.start<700) {
+    const progress=(now-f.start)/700;
+    const x=f.x*tile+30, y=f.y*tile+30;
+    glow(x,y,125*progress+36,'#ffda8380');
+    ctx.globalAlpha=1-progress;
+    ctx.strokeStyle='#ffdf92';
+    ctx.lineWidth=3;
+    ctx.beginPath();ctx.arc(x,y,14+progress*115,0,Math.PI*2);ctx.stroke();
+    ctx.globalAlpha=1;
+  }
+  const overlap=same(state.mole,state.fly);
+  sprite(state.mole,'mole',now,overlap?-14:0);
+  sprite(state.fly,'fly',now,overlap?14:0);
+  state.particles=state.particles.filter(p=>now-p.start<750);
+  for(const p of state.particles) {
+    const t=(now-p.start)/1000;
+    ctx.globalAlpha=1-t/.75;
+    box(p.x+p.vx*t,p.y+p.vy*t+t*t*65,4,4,p.color);
+  }
+  ctx.globalAlpha=1;
+  if(state.won) {
+    box(0,0,1080,540,'#061615a8');
+    box(322,198,436,144,'#162d28');
+    ctx.strokeStyle='#a4d7a7';ctx.lineWidth=2;ctx.strokeRect(322,198,436,144);
+    label('逃出地洞！',540,263,'#fff2cb',38);
+    label('鼹鼠和萤火虫都安全了',540,307,'#bce7bc',20);
+  }
+}
+
+function tick(now) {
+  for(const role of ['mole','fly']) {
+    const p=state[role];
+    if(now<p.nextMove) continue;
+    let key, latest=-1;
+    for(const [code,time] of pressed) {
+      if(controls[role][code] && time>=latest) { key=code; latest=time; }
+    }
+    if(key) {
+      move(role,controls[role][key],now);
+      p.nextMove=now+115;
+    }
+  }
+  updateGoal(now);
+  render(now);
+  requestAnimationFrame(tick);
+}
+reset();
+requestAnimationFrame(tick);
+</script>
+</body>
+</html>
